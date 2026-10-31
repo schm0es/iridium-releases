@@ -1,0 +1,212 @@
+# Builds a tag of the (private) opacity source and publishes it here: one
+# archive per platform, each signed with the updater key, plus latest.json
+# (what installed apps check for updates) and install.sh / install.ps1 (the
+# curl and PowerShell installers).
+# Started by scripts/release.sh in the source repo, or by hand from the Actions tab.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Source tag to build, e.g. v0.2.0 (the workspace version in its Cargo.toml must say 0.2.0); a commit works for a draft"
+        required: true
+      notes:
+        description: "Release notes"
+        default: ""
+      draft:
+        description: "Publish as a draft (not offered to installs and updates until published)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  # Static GPL ffmpeg for the Windows installer (gyan.dev's builds, versioned releases).
+  FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip
+  FFMPEG_SHA256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-22.04, asset: opacity-linux-x86_64.tar.gz }
+          - { os: ubuntu-22.04-arm, asset: opacity-linux-aarch64.tar.gz }
+          - { os: macos-latest, asset: opacity-macos-universal.app.tar.gz }
+          - { os: windows-latest, asset: opacity-windows-x86_64-setup.exe }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: schm0es/opacity
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+
+      - name: Version
+        id: version
+        env:
+          REF: ${{ inputs.ref }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          v=$(awk '/^\[workspace\.package\]/ { f = 1; next } /^\[/ { f = 0 } f && /^version *=/ { gsub(/^[^"]*"|".*$/, ""); print; exit }' Cargo.toml)
+          if [ -z "$v" ]; then echo "::error::no [workspace.package] version in Cargo.toml"; exit 1; fi
+          if [ "v$v" != "$REF" ] && [ "$DRAFT" != true ]; then echo "::error::$REF is not v$v (Cargo.toml)"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ runner.os == 'macOS' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      # eframe (glow, x11 + wayland), rfd and arboard load libX11, libxkbcommon,
+      # libwayland, libGL and libasound at run time, so a C toolchain is all the build needs.
+      - name: Linux build libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        env:
+          OPACITY_RELEASE: "1"
+        run: |
+          cargo build --release
+          mkdir -p out/icons
+          cp target/release/opacity packaging/linux/opacity.desktop out/
+          for n in 32 48 64 128 256 512; do python3 scripts/make-icon.py $n out/icons/$n.png; done
+          tar -czf ${{ matrix.asset }} -C out opacity opacity.desktop icons
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        env:
+          OPACITY_RELEASE: "1"
+          ARCHS: "aarch64 x86_64"
+        run: |
+          scripts/bundle-macos.sh
+          tar -czf ${{ matrix.asset }} -C target Opacity.app
+
+      # NSIS, per-user (no admin); the same setup.exe updates an installed copy.
+      # ffmpeg.exe and ffprobe.exe go next to opacity.exe, where the app looks first.
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          OPACITY_RELEASE: "1"
+        run: |
+          cargo build --release
+          curl -fsSL -o ffmpeg.zip "$FFMPEG_URL"
+          echo "$FFMPEG_SHA256  ffmpeg.zip" | sha256sum -c -
+          mkdir -p ffmpeg-bin
+          pwsh -NoProfile -Command '
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            $zip = [IO.Compression.ZipFile]::OpenRead("ffmpeg.zip")
+            foreach ($e in $zip.Entries) {
+              if ($e.FullName -match "/bin/(ffmpeg|ffprobe)\.exe$") {
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($e, "ffmpeg-bin/$($e.Name)", $true)
+              }
+            }
+            $zip.Dispose()'
+          ls -l ffmpeg-bin
+          if ! command -v makensis >/dev/null; then
+            choco install nsis -y --no-progress
+            export PATH="$PATH:/c/Program Files (x86)/NSIS"
+          fi
+          makensis -NOCD -V2 \
+            "-DVERSION=${{ steps.version.outputs.version }}" \
+            "-DEXE=$(cygpath -w target/release/opacity.exe)" \
+            "-DFFMPEG=$(cygpath -w ffmpeg-bin/ffmpeg.exe)" \
+            "-DFFPROBE=$(cygpath -w ffmpeg-bin/ffprobe.exe)" \
+            "-DICON=$(cygpath -w assets/icon.ico)" \
+            "-DOUTFILE=${{ matrix.asset }}" \
+            packaging/windows/opacity.nsi
+
+      # No Windows machine checks a release otherwise: install it silently and
+      # see that it starts and stays up.
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Start-Process ./${{ matrix.asset }} -ArgumentList '/S' -Wait
+          $dir = "$env:LOCALAPPDATA\Opacity"
+          foreach ($f in 'opacity.exe', 'ffmpeg.exe', 'ffprobe.exe') {
+            if (-not (Test-Path "$dir\$f")) { throw "not installed: $dir\$f" }
+          }
+          $p = Start-Process "$dir\opacity.exe" -PassThru
+          Start-Sleep 15
+          if ($p.HasExited) { throw "opacity exited with $($p.ExitCode)" }
+          Stop-Process $p
+
+      - name: Sign
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+        run: npx --yes @tauri-apps/cli@2.12.0 signer sign ${{ matrix.asset }}
+
+      - name: Installer
+        if: matrix.os == 'ubuntu-22.04'
+        run: mkdir -p extra && cp scripts/install.sh scripts/install.ps1 extra/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            ${{ matrix.asset }}.sig
+            extra/install.sh
+            extra/install.ps1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: latest.json
+        env:
+          V: ${{ needs.build.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+          BASE: https://github.com/${{ github.repository }}/releases/download/v${{ needs.build.outputs.version }}
+        run: |
+          mv dist/extra/* dist/ && rmdir dist/extra
+          python3 - <<'PY'
+          import json, os, datetime
+          base, d = os.environ["BASE"], "dist"
+          def entry(asset):
+              return {"url": f"{base}/{asset}", "signature": open(f"{d}/{asset}.sig").read()}
+          mac = entry("opacity-macos-universal.app.tar.gz")
+          json.dump({
+              "version": os.environ["V"],
+              "notes": os.environ["NOTES"],
+              "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "platforms": {
+                  "linux-x86_64": entry("opacity-linux-x86_64.tar.gz"),
+                  "linux-aarch64": entry("opacity-linux-aarch64.tar.gz"),
+                  "darwin-aarch64": mac,
+                  "darwin-x86_64": mac,
+                  "windows-x86_64": entry("opacity-windows-x86_64-setup.exe"),
+              },
+          }, open(f"{d}/latest.json", "w"), indent=2)
+          PY
+          ls -l dist
+
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.build.outputs.version }}
+          NOTES: ${{ inputs.notes }}
+          DRAFT: ${{ inputs.draft }}
+        run: |
+          args=()
+          [ "$DRAFT" = true ] && args+=(--draft)
+          gh release create "v$V" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Opacity $V" --notes "$NOTES" "${args[@]}"
