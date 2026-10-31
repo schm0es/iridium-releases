@@ -83,7 +83,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential pkg-config curl wget file xdg-utils libwebkit2gtk-4.1-dev libgtk-3-dev \
             libdbus-1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libfuse2 \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
             gstreamer1.0-plugins-bad gstreamer1.0-libav
 
       - run: npm ci
@@ -149,7 +149,7 @@ jobs:
           # What the installers download and verify.
           cd out
           for f in *.AppImage *.app.tar.gz *-setup.exe; do
-            if [ -f "$f" ]; then shasum -a 256 "$f" > "$f.sha256"; fi
+            if [ -f "$f" ]; then { sha256sum "$f" 2>/dev/null || shasum -a 256 "$f"; } > "$f.sha256"; fi
           done
           ls -l
 
