@@ -1,4 +1,4 @@
-# Builds a tag of the (private) opacity source and publishes it here: one
+# Builds a tag of the (private) iridium source and publishes it here: one
 # archive per platform, each signed with the updater key, plus latest.json
 # (what installed apps check for updates) and install.sh / install.ps1 (the
 # curl and PowerShell installers).
@@ -37,10 +37,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, asset: opacity-linux-x86_64.tar.gz }
-          - { os: ubuntu-22.04-arm, asset: opacity-linux-aarch64.tar.gz }
-          - { os: macos-latest, asset: opacity-macos-universal.app.tar.gz }
-          - { os: windows-latest, asset: opacity-windows-x86_64-setup.exe }
+          - { os: ubuntu-22.04, asset: iridium-linux-x86_64.tar.gz }
+          - { os: ubuntu-22.04-arm, asset: iridium-linux-aarch64.tar.gz }
+          - { os: macos-latest, asset: iridium-macos-universal.app.tar.gz }
+          - { os: windows-latest, asset: iridium-windows-x86_64-setup.exe }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -50,7 +50,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          repository: schm0es/opacity
+          repository: schm0es/iridium
           ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
 
@@ -82,29 +82,29 @@ jobs:
       - name: Build (Linux)
         if: runner.os == 'Linux'
         env:
-          OPACITY_RELEASE: "1"
+          IRIDIUM_RELEASE: "1"
         run: |
           cargo build --release
           mkdir -p out/icons
-          cp target/release/opacity packaging/linux/opacity.desktop out/
+          cp target/release/iridium packaging/linux/iridium.desktop out/
           for n in 32 48 64 128 256 512; do python3 scripts/make-icon.py $n out/icons/$n.png; done
-          tar -czf ${{ matrix.asset }} -C out opacity opacity.desktop icons
+          tar -czf ${{ matrix.asset }} -C out iridium iridium.desktop icons
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         env:
-          OPACITY_RELEASE: "1"
+          IRIDIUM_RELEASE: "1"
           ARCHS: "aarch64 x86_64"
         run: |
           scripts/bundle-macos.sh
-          tar -czf ${{ matrix.asset }} -C target Opacity.app
+          tar -czf ${{ matrix.asset }} -C target Iridium.app
 
       # NSIS, per-user (no admin); the same setup.exe updates an installed copy.
-      # ffmpeg.exe and ffprobe.exe go next to opacity.exe, where the app looks first.
+      # ffmpeg.exe and ffprobe.exe go next to iridium.exe, where the app looks first.
       - name: Build (Windows)
         if: runner.os == 'Windows'
         env:
-          OPACITY_RELEASE: "1"
+          IRIDIUM_RELEASE: "1"
         run: |
           cargo build --release
           curl -fsSL -o ffmpeg.zip "$FFMPEG_URL"
@@ -126,12 +126,12 @@ jobs:
           fi
           makensis -NOCD -V2 \
             "-DVERSION=${{ steps.version.outputs.version }}" \
-            "-DEXE=$(cygpath -w target/release/opacity.exe)" \
+            "-DEXE=$(cygpath -w target/release/iridium.exe)" \
             "-DFFMPEG=$(cygpath -w ffmpeg-bin/ffmpeg.exe)" \
             "-DFFPROBE=$(cygpath -w ffmpeg-bin/ffprobe.exe)" \
             "-DICON=$(cygpath -w assets/icon.ico)" \
             "-DOUTFILE=${{ matrix.asset }}" \
-            packaging/windows/opacity.nsi
+            packaging/windows/iridium.nsi
 
       # No Windows machine checks a release otherwise: install it silently and
       # see that it starts and stays up. Mesa's opengl32.dll and libgallium_wgl.dll
@@ -141,8 +141,8 @@ jobs:
         shell: pwsh
         run: |
           Start-Process ./${{ matrix.asset }} -ArgumentList '/S' -Wait
-          $dir = "$env:LOCALAPPDATA\Opacity"
-          foreach ($f in 'opacity.exe', 'ffmpeg.exe', 'ffprobe.exe') {
+          $dir = "$env:LOCALAPPDATA\Iridium"
+          foreach ($f in 'iridium.exe', 'ffmpeg.exe', 'ffprobe.exe') {
             if (-not (Test-Path "$dir\$f")) { throw "not installed: $dir\$f" }
           }
           Invoke-WebRequest $env:MESA_URL -OutFile mesa.7z
@@ -151,13 +151,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw '7z failed' }
           $env:GALLIUM_DRIVER = 'llvmpipe'
           $env:RUST_LOG = 'info'
-          $p = Start-Process "$dir\opacity.exe" -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
+          $p = Start-Process "$dir\iridium.exe" -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
           Start-Sleep 15
           $exited = $p.HasExited
           if ($exited) { $code = $p.ExitCode } else { Stop-Process $p }
-          Write-Host '--- opacity stdout ---'; Get-Content smoke.out -Tail 30
-          Write-Host '--- opacity stderr ---'; Get-Content smoke.err -Tail 30
-          if ($exited) { throw "opacity exited with $code" }
+          Write-Host '--- iridium stdout ---'; Get-Content smoke.out -Tail 30
+          Write-Host '--- iridium stderr ---'; Get-Content smoke.err -Tail 30
+          if ($exited) { throw "iridium exited with $code" }
 
       - name: Sign
         env:
@@ -199,17 +199,17 @@ jobs:
           base, d = os.environ["BASE"], "dist"
           def entry(asset):
               return {"url": f"{base}/{asset}", "signature": open(f"{d}/{asset}.sig").read()}
-          mac = entry("opacity-macos-universal.app.tar.gz")
+          mac = entry("iridium-macos-universal.app.tar.gz")
           json.dump({
               "version": os.environ["V"],
               "notes": os.environ["NOTES"],
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": {
-                  "linux-x86_64": entry("opacity-linux-x86_64.tar.gz"),
-                  "linux-aarch64": entry("opacity-linux-aarch64.tar.gz"),
+                  "linux-x86_64": entry("iridium-linux-x86_64.tar.gz"),
+                  "linux-aarch64": entry("iridium-linux-aarch64.tar.gz"),
                   "darwin-aarch64": mac,
                   "darwin-x86_64": mac,
-                  "windows-x86_64": entry("opacity-windows-x86_64-setup.exe"),
+                  "windows-x86_64": entry("iridium-windows-x86_64-setup.exe"),
               },
           }, open(f"{d}/latest.json", "w"), indent=2)
           PY
@@ -224,4 +224,4 @@ jobs:
         run: |
           args=()
           [ "$DRAFT" = true ] && args+=(--draft)
-          gh release create "v$V" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Opacity $V" --notes "$NOTES" "${args[@]}"
+          gh release create "v$V" dist/* --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Iridium $V" --notes "$NOTES" "${args[@]}"
