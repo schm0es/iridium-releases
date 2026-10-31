@@ -26,6 +26,10 @@ env:
   # Static GPL ffmpeg for the Windows installer (gyan.dev's builds, versioned releases).
   FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip
   FFMPEG_SHA256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
+  # Software OpenGL (Mesa llvmpipe) for the Windows smoke test only: the runners
+  # have no GPU, and eframe's glow backend needs OpenGL 2.0+. Not shipped.
+  MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z
+  MESA_SHA256: 351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695
 
 jobs:
   build:
@@ -130,7 +134,8 @@ jobs:
             packaging/windows/opacity.nsi
 
       # No Windows machine checks a release otherwise: install it silently and
-      # see that it starts and stays up.
+      # see that it starts and stays up. Mesa's opengl32.dll and libgallium_wgl.dll
+      # go next to the installed exe (test only) to stand in for a GPU driver.
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
@@ -140,6 +145,11 @@ jobs:
           foreach ($f in 'opacity.exe', 'ffmpeg.exe', 'ffprobe.exe') {
             if (-not (Test-Path "$dir\$f")) { throw "not installed: $dir\$f" }
           }
+          Invoke-WebRequest $env:MESA_URL -OutFile mesa.7z
+          if ((Get-FileHash mesa.7z -Algorithm SHA256).Hash -ne $env:MESA_SHA256) { throw 'mesa.7z checksum mismatch' }
+          7z e mesa.7z x64/opengl32.dll x64/libgallium_wgl.dll "-o$dir" -y
+          if ($LASTEXITCODE -ne 0) { throw '7z failed' }
+          $env:GALLIUM_DRIVER = 'llvmpipe'
           $env:RUST_LOG = 'info'
           $p = Start-Process "$dir\opacity.exe" -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
           Start-Sleep 15
