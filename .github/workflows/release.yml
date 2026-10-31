@@ -30,6 +30,7 @@ env:
 jobs:
   build:
     strategy:
+      fail-fast: false
       matrix:
         include:
           - { os: ubuntu-22.04, asset: opacity-linux-x86_64.tar.gz }
@@ -139,10 +140,14 @@ jobs:
           foreach ($f in 'opacity.exe', 'ffmpeg.exe', 'ffprobe.exe') {
             if (-not (Test-Path "$dir\$f")) { throw "not installed: $dir\$f" }
           }
-          $p = Start-Process "$dir\opacity.exe" -PassThru
+          $env:RUST_LOG = 'info'
+          $p = Start-Process "$dir\opacity.exe" -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
           Start-Sleep 15
-          if ($p.HasExited) { throw "opacity exited with $($p.ExitCode)" }
-          Stop-Process $p
+          $exited = $p.HasExited
+          if ($exited) { $code = $p.ExitCode } else { Stop-Process $p }
+          Write-Host '--- opacity stdout ---'; Get-Content smoke.out -Tail 30
+          Write-Host '--- opacity stderr ---'; Get-Content smoke.err -Tail 30
+          if ($exited) { throw "opacity exited with $code" }
 
       - name: Sign
         env:
