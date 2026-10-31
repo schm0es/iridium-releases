@@ -1,7 +1,7 @@
-# Builds a tag of the (private) iridium source and publishes it here: one
-# archive per platform, each signed with the updater key, plus latest.json
-# (what installed apps check for updates) and install.sh / install.ps1 (the
-# curl and PowerShell installers).
+# Builds a tag of the (private) iridium source and publishes it here: the Tauri
+# bundles for every platform (the updater ones signed with the updater key),
+# latest.json (what installed apps check for updates) and install.sh /
+# install.ps1 (the curl and PowerShell installers).
 # Started by scripts/release.sh in the source repo, or by hand from the Actions tab.
 name: release
 
@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Source tag to build, e.g. v0.2.0 (the workspace version in its Cargo.toml must say 0.2.0); a commit works for a draft"
+        description: "Source tag to build, e.g. v0.2.0 (the workspace version in its Cargo.toml and src-tauri/tauri.conf.json must say 0.2.0); a commit works for a draft"
         required: true
       notes:
         description: "Release notes"
@@ -26,10 +26,6 @@ env:
   # Static GPL ffmpeg for the Windows installer (gyan.dev's builds, versioned releases).
   FFMPEG_URL: https://github.com/GyanD/codexffmpeg/releases/download/9.0.2/ffmpeg-9.0.2-essentials_build.zip
   FFMPEG_SHA256: 60f467265b1e312373dbcd92200c2618a74850f98d3d078e94296bb3fa2047ba
-  # Software OpenGL (Mesa llvmpipe) for the Windows smoke test only: the runners
-  # have no GPU, and eframe's glow backend needs OpenGL 2.0+. Not shipped.
-  MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.2.4/mesa3d-26.2.4-release-msvc.7z
-  MESA_SHA256: 351fc8c8b695878ffb3eaa044b3ead08672a48b1a045e3c3e3975811df0f6695
 
 jobs:
   build:
@@ -37,10 +33,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-22.04, asset: iridium-linux-x86_64.tar.gz }
-          - { os: ubuntu-22.04-arm, asset: iridium-linux-aarch64.tar.gz }
-          - { os: macos-latest, asset: iridium-macos-universal.app.tar.gz }
-          - { os: windows-latest, asset: iridium-windows-x86_64-setup.exe }
+          - { os: ubuntu-22.04, name: linux-x86_64 }
+          - { os: ubuntu-22.04-arm, name: linux-aarch64 }
+          - { os: macos-latest, name: macos-universal }
+          - { os: windows-latest, name: windows-x86_64 }
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -63,7 +59,15 @@ jobs:
           v=$(awk '/^\[workspace\.package\]/ { f = 1; next } /^\[/ { f = 0 } f && /^version *=/ { gsub(/^[^"]*"|".*$/, ""); print; exit }' Cargo.toml)
           if [ -z "$v" ]; then echo "::error::no [workspace.package] version in Cargo.toml"; exit 1; fi
           if [ "v$v" != "$REF" ] && [ "$DRAFT" != true ]; then echo "::error::$REF is not v$v (Cargo.toml)"; exit 1; fi
+          # The updater compares against the version in tauri.conf.json, so it must agree.
+          c=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          if [ "$c" != "$v" ]; then echo "::error::src-tauri/tauri.conf.json says $c, Cargo.toml says $v"; exit 1; fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -71,112 +75,112 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # eframe (glow, x11 + wayland), rfd and arboard load libX11, libxkbcommon,
-      # libwayland, libGL and libasound at run time, so a C toolchain is all the build needs.
+      # WebKitGTK 4.1 and the Tauri build libraries, plus the GStreamer plugins the
+      # AppImage bundles (bundleMediaFramework) so audio and video play in the web view.
       - name: Linux build libraries
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential pkg-config
+          sudo apt-get install -y build-essential pkg-config curl wget file xdg-utils libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libdbus-1-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libfuse2 \
+            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad gstreamer1.0-libav
 
-      - name: Build (Linux)
-        if: runner.os == 'Linux'
-        env:
-          IRIDIUM_RELEASE: "1"
-        run: |
-          cargo build --release
-          mkdir -p out/icons
-          cp target/release/iridium packaging/linux/iridium.desktop out/
-          for n in 32 48 64 128 256 512; do python3 scripts/make-icon.py $n out/icons/$n.png; done
-          tar -czf ${{ matrix.asset }} -C out iridium iridium.desktop icons
+      - run: npm ci
 
-      - name: Build (macOS)
-        if: runner.os == 'macOS'
-        env:
-          IRIDIUM_RELEASE: "1"
-          ARCHS: "aarch64 x86_64"
-        run: |
-          scripts/bundle-macos.sh
-          tar -czf ${{ matrix.asset }} -C target Iridium.app
-
-      # NSIS, per-user (no admin); the same setup.exe updates an installed copy.
-      # ffmpeg.exe and ffprobe.exe go next to iridium.exe, where the app looks first.
-      - name: Build (Windows)
+      # ffmpeg.exe and ffprobe.exe become Tauri resources (src-tauri/tauri.windows.conf.json),
+      # installed in <install dir>\bin, where the app looks first.
+      - name: ffmpeg (Windows)
         if: runner.os == 'Windows'
-        env:
-          IRIDIUM_RELEASE: "1"
         run: |
-          cargo build --release
           curl -fsSL -o ffmpeg.zip "$FFMPEG_URL"
           echo "$FFMPEG_SHA256  ffmpeg.zip" | sha256sum -c -
-          mkdir -p ffmpeg-bin
+          mkdir -p src-tauri/resources/bin
           pwsh -NoProfile -Command '
             Add-Type -AssemblyName System.IO.Compression.FileSystem
             $zip = [IO.Compression.ZipFile]::OpenRead("ffmpeg.zip")
             foreach ($e in $zip.Entries) {
               if ($e.FullName -match "/bin/(ffmpeg|ffprobe)\.exe$") {
-                [IO.Compression.ZipFileExtensions]::ExtractToFile($e, "ffmpeg-bin/$($e.Name)", $true)
+                [IO.Compression.ZipFileExtensions]::ExtractToFile($e, "src-tauri/resources/bin/$($e.Name)", $true)
               }
             }
             $zip.Dispose()'
-          ls -l ffmpeg-bin
-          if ! command -v makensis >/dev/null; then
-            choco install nsis -y --no-progress
-            export PATH="$PATH:/c/Program Files (x86)/NSIS"
-          fi
-          makensis -NOCD -V2 \
-            "-DVERSION=${{ steps.version.outputs.version }}" \
-            "-DEXE=$(cygpath -w target/release/iridium.exe)" \
-            "-DFFMPEG=$(cygpath -w ffmpeg-bin/ffmpeg.exe)" \
-            "-DFFPROBE=$(cygpath -w ffmpeg-bin/ffprobe.exe)" \
-            "-DICON=$(cygpath -w assets/icon.ico)" \
-            "-DOUTFILE=${{ matrix.asset }}" \
-            packaging/windows/iridium.nsi
+          ls -l src-tauri/resources/bin
 
-      # No Windows machine checks a release otherwise: install it silently and
-      # see that it starts and stays up. Mesa's opengl32.dll and libgallium_wgl.dll
-      # go next to the installed exe (test only) to stand in for a GPU driver.
+      # tauri build signs the updater bundles (AppImage, .app.tar.gz, setup.exe) with
+      # the updater key and writes a .sig beside each one.
+      - name: Build
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          case "$RUNNER_OS" in
+            Linux) npx tauri build --bundles appimage,deb,rpm ;;
+            macOS) npx tauri build --target universal-apple-darwin --bundles app --config '{"bundle":{"macOS":{"signingIdentity":"-"}}}' ;;
+            Windows) npx tauri build --bundles nsis ;;
+          esac
+
+      # Stable asset names; a .sig stays valid under a new name (it signs the bytes).
+      - name: Stage
+        env:
+          NAME: ${{ matrix.name }}
+        run: |
+          mkdir -p out
+          bundle=target/release/bundle
+          if [ "$RUNNER_OS" = macOS ]; then bundle=target/universal-apple-darwin/release/bundle; fi
+          take() { # take <glob> <asset> [sig]
+            local f; f=$(ls $1 2>/dev/null | head -1)
+            [ -n "$f" ] || { echo "::error::no build output matching $1"; exit 1; }
+            cp "$f" "out/$2"
+            if [ "${3:-}" = sig ]; then
+              [ -f "$f.sig" ] || { echo "::error::$f.sig is missing (is TAURI_SIGNING_PRIVATE_KEY set?)"; exit 1; }
+              cp "$f.sig" "out/$2.sig"
+            fi
+          }
+          case "$RUNNER_OS" in
+            Linux)
+              take "$bundle/appimage/*.AppImage" "iridium-$NAME.AppImage" sig
+              take "$bundle/deb/*.deb" "iridium-$NAME.deb"
+              take "$bundle/rpm/*.rpm" "iridium-$NAME.rpm" ;;
+            macOS) take "$bundle/macos/*.app.tar.gz" "iridium-$NAME.app.tar.gz" sig ;;
+            Windows) take "$bundle/nsis/*-setup.exe" "iridium-$NAME-setup.exe" sig ;;
+          esac
+          # What the installers download and verify.
+          cd out
+          for f in *.AppImage *.app.tar.gz *-setup.exe; do
+            if [ -f "$f" ]; then shasum -a 256 "$f" > "$f.sha256"; fi
+          done
+          ls -l
+
+      # No Windows machine checks a release otherwise: install it silently, see that
+      # the bundled ffmpeg and the Default apps registration are in place, and that
+      # the app starts and stays up.
       - name: Smoke test (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Start-Process ./${{ matrix.asset }} -ArgumentList '/S' -Wait
+          Start-Process ./out/iridium-windows-x86_64-setup.exe -ArgumentList '/S' -Wait
           $dir = "$env:LOCALAPPDATA\Iridium"
-          foreach ($f in 'iridium.exe', 'ffmpeg.exe', 'ffprobe.exe') {
+          foreach ($f in 'iridium.exe', 'bin\ffmpeg.exe', 'bin\ffprobe.exe') {
             if (-not (Test-Path "$dir\$f")) { throw "not installed: $dir\$f" }
           }
-          Invoke-WebRequest $env:MESA_URL -OutFile mesa.7z
-          if ((Get-FileHash mesa.7z -Algorithm SHA256).Hash -ne $env:MESA_SHA256) { throw 'mesa.7z checksum mismatch' }
-          7z e mesa.7z x64/opengl32.dll x64/libgallium_wgl.dll "-o$dir" -y
-          if ($LASTEXITCODE -ne 0) { throw '7z failed' }
-          $env:GALLIUM_DRIVER = 'llvmpipe'
-          $env:RUST_LOG = 'info'
-          $p = Start-Process "$dir\iridium.exe" -PassThru -RedirectStandardOutput smoke.out -RedirectStandardError smoke.err
+          if (-not (Get-ItemProperty 'HKCU:\Software\RegisteredApplications' -Name Iridium -ErrorAction SilentlyContinue)) {
+            throw 'Iridium is not registered for Default apps'
+          }
+          $p = Start-Process "$dir\iridium.exe" -PassThru
           Start-Sleep 15
-          $exited = $p.HasExited
-          if ($exited) { $code = $p.ExitCode } else { Stop-Process $p }
-          Write-Host '--- iridium stdout ---'; Get-Content smoke.out -Tail 30
-          Write-Host '--- iridium stderr ---'; Get-Content smoke.err -Tail 30
-          if ($exited) { throw "iridium exited with $code" }
+          if ($p.HasExited) { throw "iridium exited with $($p.ExitCode)" }
+          Stop-Process $p
 
-      - name: Sign
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ""
-        run: npx --yes @tauri-apps/cli@2.12.0 signer sign ${{ matrix.asset }}
-
-      - name: Installer
+      - name: Installers
         if: matrix.os == 'ubuntu-22.04'
-        run: mkdir -p extra && cp scripts/install.sh scripts/install.ps1 extra/
+        run: cp scripts/install.sh scripts/install.ps1 out/
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset }}
-          path: |
-            ${{ matrix.asset }}
-            ${{ matrix.asset }}.sig
-            extra/install.sh
-            extra/install.ps1
+          name: ${{ matrix.name }}
+          path: out/*
 
   publish:
     needs: build
@@ -193,7 +197,6 @@ jobs:
           NOTES: ${{ inputs.notes }}
           BASE: https://github.com/${{ github.repository }}/releases/download/v${{ needs.build.outputs.version }}
         run: |
-          mv dist/extra/* dist/ && rmdir dist/extra
           python3 - <<'PY'
           import json, os, datetime
           base, d = os.environ["BASE"], "dist"
@@ -205,8 +208,8 @@ jobs:
               "notes": os.environ["NOTES"],
               "pub_date": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
               "platforms": {
-                  "linux-x86_64": entry("iridium-linux-x86_64.tar.gz"),
-                  "linux-aarch64": entry("iridium-linux-aarch64.tar.gz"),
+                  "linux-x86_64": entry("iridium-linux-x86_64.AppImage"),
+                  "linux-aarch64": entry("iridium-linux-aarch64.AppImage"),
                   "darwin-aarch64": mac,
                   "darwin-x86_64": mac,
                   "windows-x86_64": entry("iridium-windows-x86_64-setup.exe"),
